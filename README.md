@@ -21,8 +21,14 @@ The script automatically installs the required packages if they are not already 
 
 To run the application, execute the following command:
 
+**Windows**
 ```shell
 pythonw log_browser.py
+```
+
+**MacOS/Linux GUI**
+```shell
+python log_browser.py
 ```
 
 ### SSH Connection
