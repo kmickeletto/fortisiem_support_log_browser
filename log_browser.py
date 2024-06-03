@@ -14,8 +14,9 @@ pip_packages = {
 standard_modules = [
     'tkinter', 'argparse', 'datetime', 'time', 're', 'glob', 'os',
     'ctypes', 'platform', 'base64', 'io', 'tempfile', 'uuid', 'tarfile',
-    'gzip', 'shutil', 'threading', 'winreg', 'queue', 'textwrap', 'fnmatch',
-    'itertools', 'collections', 'functools', 'gc', 'json', 'xml.etree.ElementTree', 'xml.dom'
+    'gzip', 'shutil', 'threading', 'winreg', 'queue', 'fnmatch',
+    'itertools', 'collections', 'functools', 'gc', 'json', 'xml.etree.ElementTree',
+    'xml.dom', 'packaging'
 ]
 
 # Function to install packages using pip
@@ -49,6 +50,7 @@ if installed_any:
 from recursive_extractor import RecursiveExtractor
 from log_module import get_logger_instance, DummyLogger
 from updater import AutoUpdater
+from ssh_client import SSHClient
 import logging
 import tkinter as tk
 from tkinter import ttk, messagebox, font, PhotoImage, scrolledtext, filedialog
@@ -66,15 +68,11 @@ import platform
 import tempfile
 import uuid
 import sys
-import tarfile, zipfile, lzma
-import gzip
+import tarfile
 import shutil
 import threading
-import paramiko
-from scp import SCPClient
 import queue
 from PyQt6 import QtWidgets, QtCore, QtGui
-import textwrap
 import yaml
 from itertools import cycle, count
 from collections import defaultdict
@@ -163,288 +161,6 @@ class Spinner(tk.Label):
             self.config(image='')
         self.place_forget()
 
-class SSHClient(tk.Frame):
-    def __init__(self, parent, hostname, username, password=None, key_filename=None, days=1, on_complete=None, theme="dark"):
-        super().__init__(parent)
-        self.on_complete = on_complete
-        self.parent = parent
-        self.hostname = hostname
-        self.username = username
-        self.password = password
-        self.key_filename = key_filename
-        self.days = days
-        self.client = None
-        self.scp = None
-        self.connected = False
-        self.command_successful = False
-        self.result_queue = queue.Queue()
-        self.transfer_rates = []
-        self.parent.after(1000, self.check_queue)
-        self.start_time = None
-
-        self.parent.configure(background='black')
-        self.parent.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.parent.title("SSH Client")
-
-        self.progress_bar = ttk.Progressbar(self.parent, orient='horizontal', length=400, mode='determinate')
-        self.status_label = tk.Label(self.parent, text="", foreground='white', background='black')
-        self.eta_label = tk.Label(self.parent, text="", foreground='white', background='black')
-        self.output_text = tk.Text(self.parent, height=20, width=80, bg='black', fg='white', insertbackground='white', padx=5, pady=5, state='disabled')
-        self.output_text.pack()
-        self.output_text.tag_configure('normal', foreground='white')
-        self.output_text.tag_configure('info', foreground='cyan')
-        self.output_text.tag_configure('warn', foreground='yellow')
-        self.output_text.tag_configure('error', foreground='red')
-
-        # Pack but hide progress-related widgets initially
-        self.progress_bar.pack(pady=10)
-        self.status_label.pack(pady=5)
-        self.eta_label.pack(pady=5)
-
-        # Apply the theme
-        self.apply_theme(theme)
-
-    def apply_theme(self, theme):
-        if theme == "dark":
-            self.output_text.config(bg='black', fg='white', insertbackground='white')
-            self.status_label.config(fg='white', bg='black')
-            self.eta_label.config(fg='white', bg='black')
-        else:
-            self.output_text.config(bg='white', fg='black', insertbackground='black')
-            self.status_label.config(fg='black', bg='white')
-            self.eta_label.config(fg='black', bg='white')
-
-    def check_queue(self):
-        try:
-            result_path = self.result_queue.get_nowait()
-            self.launch_extractor(result_path)
-            self.parent.after(1000, self.check_queue)
-        except queue.Empty:
-            self.parent.after(1000, self.check_queue)
-        except Exception as e:
-            print(f"Error in check_queue: {e}")
-            self.parent.after(1000, self.check_queue)
-        
-    def start_operations(self, command, download_path, result_queue):
-        thread = threading.Thread(target=self.execute_ssh_operations, args=(command, download_path, result_queue), daemon=True)
-        thread.start()
-
-    def execute_ssh_operations(self, command, download_path, result_queue):
-        self.connect()
-        if self.connected:
-            if not self.is_root_user():
-                run_command = f"sudo su -c 'source /opt/phoenix/bin/.bashrc && {command} {self.days}'"
-                self.print_text(f"User is not root, escalating privileges to root\n", 'warn')
-            else:
-                run_command = f"{command} {self.days}"
-            self.extract_and_download(run_command, download_path, result_queue)
-
-    def is_root_user(self):
-        stdin, stdout, stderr = self.client.exec_command("id -u")
-        user_id = stdout.read().strip()
-        return user_id == b'0'
-
-    def connect(self):
-        try:
-            self.print_text(f"Connecting to {self.hostname}\n", 'info')
-            self.client = paramiko.SSHClient()
-            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            
-            pkey = None
-            if self.key_filename:
-                with open(self.key_filename, 'r') as key_file:
-                    key_data = key_file.read()
-                    pkey = paramiko.RSAKey.from_private_key_file(self.key_filename)
-            
-            self.client.connect(
-                self.hostname,
-                username=self.username,
-                password=self.password,
-                pkey=pkey,
-                look_for_keys=False,
-                compress=True,
-                allow_agent=False,
-                timeout=10,
-                banner_timeout=200
-            )
-            
-            transport = self.client.get_transport()
-            transport.default_window_size = 2147483647
-            transport.local_cipher = 'arcfour'
-
-            # Create a new session to read the banner message
-            session = transport.open_session()
-            session.get_pty()
-            session.invoke_shell()
-
-            banner_message = ""
-            while True:
-                line = session.recv(1024).decode('utf-8')
-                if line.endswith("$ ") or line.endswith("# "):  # Typical shell prompt endings
-                    break
-                banner_message += line
-            self.print_text(banner_message + "\n", 'info')
-
-            # Close the session after reading the banner message
-            session.close()
-
-            self.scp = SCPClient(transport, progress=self.progress)
-            self.connected = True
-        except Exception as e:
-            self.print_text(f"Connection failed: {e}\n", "error")
-            self.connected = False
-            
-    def extract_and_download(self, command, download_path, result_queue):
-        if not self.is_alive():
-            return  # Abort
-        try:
-            stdin, stdout, stderr = self.client.exec_command(command)
-            stdout_output = []
-            stderr_output = []
-            file_name = None
-            regex = re.compile(r'^(\/(?:[^\/\s]+\/)*[^\/\s]+\.\S{3})\s+created,')
-    
-            while True:
-                if not self.is_alive():
-                    break
-                line = stdout.readline()
-                if line:
-                    match = regex.search(line)
-                    if match:
-                        file_name = match.group(1)
-                        self.print_text(f"Detected file creation: {file_name}\n", 'info')
-                    elif line.startswith("Warning:"):
-                        continue  # Skip warning lines
-                    else:
-                        self.print_text(line, 'normal')
-                        stdout_output.append(line)
-    
-                error_line = stderr.readline()
-                # No need for error output
-                #if error_line:
-                #    self.print_text(error_line, 'error')
-                #    stderr_output.append(error_line)
-    
-                if stdout.channel.exit_status_ready() and not line:
-                    break
-    
-            exit_status = stdout.channel.recv_exit_status()
-            if exit_status == 0:
-                self.command_successful = True
-                if file_name:
-                    local_path = self.download_file(file_name, download_path)
-                    if local_path:
-                        self.delete_remote_file(file_name)
-                        self.parent.after(0, lambda: result_queue.put(local_path))
-                        if self.on_complete:
-                            self.parent.after(0, self.on_complete)
-            else:
-                self.command_successful = False
-                if stderr_output:
-                    error_message = ''.join(stderr_output)
-                    self.print_text(f"Command failed with exit status {exit_status}: {error_message}\n", "error")
-                else:
-                    self.print_text(f"Command failed with exit status {exit_status}\n", "error")
-        except Exception as e:
-            self.print_text(f"Failed to execute command: {e}\n", "error")
-            self.command_successful = False
-        
-    def download_file(self, remote_path, local_path):
-        self.remote_path = remote_path
-        self.start_time = time.time()
-    
-        try:
-            self.scp.get(remote_path, local_path, preserve_times=False)  # Set preserve_times to False
-            return local_path
-        except Exception as e:
-            self.print_text(f"\nFailed to download file: {e}\n", "error")
-            return False
-
-    def delete_remote_file(self, remote_path):
-        try:
-            # Use sudo to delete the file to handle permission issues
-            stdin, stdout, stderr = self.client.exec_command(f"sudo rm -f {remote_path}")
-            stdout.channel.recv_exit_status()  # Block until command finishes
-            if stdout.channel.recv_exit_status() == 0:
-                self.print_text(f"Deleted remote file: {remote_path}\n", 'info')
-            else:
-                error_message = stderr.read().decode()
-                self.print_text(f"Failed to delete remote file: {error_message}\n", 'error')
-        except Exception as e:
-            self.print_text(f"Failed to delete remote file: {e}\n", 'error')
-
-    def progress(self, filename, size, sent):
-        if not self.is_alive():
-            return
-    
-        current_time = time.time()
-        elapsed_time = current_time - self.start_time
-        size_mb = size / (1024 * 1024)
-        sent_mb = sent / (1024 * 1024)
-        progress = (sent_mb / size_mb) * 100 if size_mb > 0 else 0
-    
-        transfer_rate = (sent * 8) / (1024 * 1024 * elapsed_time) if elapsed_time > 0 else 0
-        eta = ((size - sent) / transfer_rate) / 100000 if transfer_rate > 0 else 0
-    
-        eta_str = self.format_eta(eta)
-    
-        # Limit updates to once per second
-        if int(current_time - self.start_time) % 1 == 0:
-            self.parent.after(0, lambda: self.update_progress_bar(progress, size_mb, transfer_rate, eta_str))
-
-    def update_progress_bar(self, progress, size_mb, transfer_rate, eta_str):
-        try:
-            if not self.progress_bar.winfo_exists():
-                return
-            self.progress_bar['value'] = progress
-            self.status_label['text'] = (f"Downloading: {self.remote_path} - {size_mb:.2f} MB ({int(progress)}% complete) / "
-                                        f"{transfer_rate:.2f} Mbps")
-            self.eta_label['text'] = f"ETA: {eta_str}"
-            self.parent.update_idletasks()
-        except tk.TclError:
-            pass
-            
-    def format_eta(self, eta_seconds):
-        eta_seconds = round(eta_seconds)
-        hours, remainder = divmod(eta_seconds, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        if hours > 0:
-            return f"{hours}h {minutes}m {seconds}s"
-        elif minutes > 0:
-            return f"{minutes}m {seconds}s"
-        else:
-            return f"{seconds}s"
-
-    def is_alive(self):
-        try:
-            return self.parent.winfo_exists()
-        except RuntimeError:
-            return False
-
-    def print_text(self, text, tag=None):
-        if self.is_alive():
-            fixed_width = 80
-            wrapped_text = textwrap.fill(text, width=fixed_width)
-            self.output_text.config(state='normal')  # Enable writing
-            self.output_text.insert(tk.END, wrapped_text + '\n', tag)
-            self.output_text.config(state='disabled')  # Set back to read-only
-            self.output_text.see(tk.END)
-            self.output_text.update_idletasks()
-
-    def on_close(self):
-        self.close()
-        try:
-            self.parent.destroy()
-        except tk.TclError:
-            pass
-    
-    def close(self):
-        if self.client:
-            self.client.close()
-        if self.scp:
-            self.scp.close()
-        self.connected = False
-
 class SSHCredentialsForm(tk.Frame):
     def __init__(self, parent, callback, initial_credentials=None, theme="light"):
         super().__init__(parent)
@@ -465,7 +181,7 @@ class SSHCredentialsForm(tk.Frame):
         self.hostname_entry.insert(0, initial_credentials.get('hostname', ''))
         self.username_entry.insert(0, initial_credentials.get('username', ''))
         if 'keyfile' in initial_credentials and initial_credentials['keyfile']:
-            self.key_entry.insert(0, initial_credentials.get('keyfile', ''))
+            self.key_entry.insert(0, os.path.normpath(initial_credentials['keyfile']))
             self.auth_var.set('key')
             self.toggle_auth_method()
         elif 'password' in initial_credentials:
@@ -475,15 +191,21 @@ class SSHCredentialsForm(tk.Frame):
         self.validate_inputs()
 
     def init_ui(self):
+        style = ttk.Style()
+        style.configure("TEntry", padding=2, relief="flat", borderwidth=1)
+        style.configure("Error.TEntry", padding=2, relief="flat", borderwidth=1, background="red")
+
         self.auth_var = tk.StringVar(value='password')
 
         ttk.Label(self, text="Hostname/IP:").grid(row=0, column=0, sticky="w")
-        self.hostname_entry = ttk.Entry(self)
+        self.hostname_var = tk.StringVar()
+        self.hostname_var.trace_add("write", self.validate_inputs)
+        self.hostname_entry = ttk.Entry(self, textvariable=self.hostname_var, style="TEntry")
         self.hostname_entry.grid(row=0, column=1, columnspan=4, padx=5)
         self.hostname_entry.focus_set()
 
         ttk.Label(self, text="Username:").grid(row=1, column=0, sticky="w")
-        self.username_entry = ttk.Entry(self)
+        self.username_entry = ttk.Entry(self, style="TEntry")
         self.username_entry.grid(row=1, column=1, columnspan=4, padx=5)
 
         auth_frame = ttk.LabelFrame(self, text="Authentication Method", padding=5)
@@ -496,9 +218,9 @@ class SSHCredentialsForm(tk.Frame):
         self.auth_label = ttk.Label(self, text="Password:")
         self.auth_label.grid(row=2, column=0, pady=3, sticky="w")
 
-        self.password_entry = ttk.Entry(self, show="*")
+        self.password_entry = ttk.Entry(self, show="*", style="TEntry")
         self.password_entry.grid(row=2, column=1, columnspan=4, pady=3, padx=5)
-        self.key_entry = ttk.Entry(self)
+        self.key_entry = ttk.Entry(self, style="TEntry")
         self.key_entry.grid(row=2, column=1, columnspan=4, pady=3)
         self.key_entry.grid_remove()
         self.browse_button = ttk.Button(self, text="Browse", command=self.browse_keyfile)
@@ -526,7 +248,6 @@ class SSHCredentialsForm(tk.Frame):
             widget.lift()
 
         self.parent.bind("<Return>", lambda event: self.submit_credentials())
-        self.hostname_entry.bind("<KeyRelease>", self.validate_inputs)
         self.username_entry.bind("<KeyRelease>", self.validate_inputs)
         self.password_entry.bind("<KeyRelease>", self.validate_inputs)
         self.key_entry.bind("<KeyRelease>", self.validate_inputs)
@@ -534,17 +255,41 @@ class SSHCredentialsForm(tk.Frame):
     def update_days_label(self, value):
         self.days_value.set(str(int(float(value))))
 
-    def validate_inputs(self, event=None):
+    def validate_hostname(self, hostname):
+        if not hostname:
+            return False
+
+        hostname_regex = re.compile(
+            r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)$|"
+            r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,6}\.?$|"
+            r"^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}"
+            r"(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$"
+        )
+
+        if hostname_regex.match(hostname):
+            return True
+        return False
+
+    def validate_inputs(self, *args):
+        hostname_valid = self.validate_hostname(self.hostname_var.get().strip())
+        self.update_entry_border(self.hostname_entry, hostname_valid)
+
         if self.auth_var.get() == 'password':
-            if self.hostname_entry.get().strip() and self.username_entry.get().strip() and self.password_entry.get().strip():
+            if hostname_valid and self.hostname_var.get().strip() and self.username_entry.get().strip() and self.password_entry.get().strip():
                 self.submit_button['state'] = 'normal'
             else:
                 self.submit_button['state'] = 'disabled'
         else:
-            if self.hostname_entry.get().strip() and self.username_entry.get().strip() and self.key_entry.get().strip():
+            if hostname_valid and self.hostname_var.get().strip() and self.username_entry.get().strip() and self.key_entry.get().strip():
                 self.submit_button['state'] = 'normal'
             else:
                 self.submit_button['state'] = 'disabled'
+
+    def update_entry_border(self, entry, valid):
+        if valid:
+            entry.config(style="TEntry")
+        else:
+            entry.config(style="Error.TEntry")
 
     def toggle_auth_method(self):
         if self.auth_var.get() == 'password':
@@ -579,7 +324,7 @@ class SSHCredentialsForm(tk.Frame):
 
         if filename:
             self.key_entry.delete(0, tk.END)
-            self.key_entry.insert(0, filename)
+            self.key_entry.insert(0, os.path.normpath(filename))
 
         self.parent.focus_force()
         self.validate_inputs()
@@ -589,7 +334,7 @@ class SSHCredentialsForm(tk.Frame):
             self.parent.destroy()
 
     def submit_credentials(self, event=None):
-        hostname = self.hostname_entry.get().strip()
+        hostname = self.hostname_var.get().strip()
         username = self.username_entry.get().strip()
         days = int(float(self.days_entry.get()))
         if days == 0:
@@ -1383,15 +1128,15 @@ class LogParser:
     
 class LogViewerApp:
     def __init__(self, root, current_version, logger=None):
-        sv_ttk.set_theme("light")
+#        sv_ttk.set_theme("light")
         self.repo_name = 'kmickeletto/fortisiem_support_log_browser'
-        self.current_commit_sha = current_version
-        self.updater = AutoUpdater(self.repo_name, current_version, logger=logger)
+        self.current_version = current_version
+        self.updater = AutoUpdater(self.repo_name, self.current_version, logger=logger)
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
         self.root = root
         self.logger = logger.get_logger(self) if logger else DummyLogger()
         self.logger.info("LogViewerApp initialized")
-        self.root.title("FortiSIEM Support Log Viewer")
+        self.root.title(f"FortiSIEM Support Log Viewer {self.current_version}")
         self.ssh_objects = []
         self.logbase = None
         self.date_to_logs = {}
@@ -1418,6 +1163,7 @@ class LogViewerApp:
         self.notebook.bind('<ButtonRelease-1>', self.on_tab_drag_end)
         self.tab_drag_data = {'start_index': None, 'end_index': None}
         self.config_manager = ConfigManager()
+        self.check_for_updates()
 
     def log(self, level, message):
         if self.logger:
@@ -1516,7 +1262,6 @@ class LogViewerApp:
         self.add_right_click_menu(self.tree_appsvr)
 
         self.update_ui_elements('disabled')
-        self.check_for_updates()
         self.initialize_default_tab()
 
     def initialize_menu(self):
@@ -2005,8 +1750,8 @@ class LogViewerApp:
                 tree.column(col, width=final_width)
     
         # Minimum and maximum widths for each column
-        min_widths = [40, 50, 50, 175, 65, 50, 55]
-        max_widths = [75, 50, 50, 400, 95, 300, 75]
+        min_widths = [40, 55, 55, 175, 65, 50, 55]
+        max_widths = [75, 55, 55, 375, 95, 300, 75]
     
         # Apply width adjustments to both Treeviews
         adjust_tree_columns(self.tree_backend, min_widths, max_widths)
@@ -2428,7 +2173,7 @@ class LogViewerApp:
             key_filename=credentials.get('keyfile'),
             days=credentials['days'],
             on_complete=self.on_ssh_complete,
-            theme="dark"
+            logger=self.logger
         )
         
         self.ssh_window.withdraw()  # Hide the window until it's positioned
@@ -2506,8 +2251,9 @@ class LogViewerApp:
         return date_to_logs
     
     def check_for_updates(self):
-        if self.updater.check_for_updates():
-            if messagebox.askyesno('Update Available', 'A new version is available. Do you want to update?'):
+        update = self.updater.check_for_updates()
+        if update:
+            if messagebox.askyesno('Update Available', f'FortiSIEM Support Log Viewer {update} is available. Do you want to update?'):
                 zip_path = self.updater.download_latest_version()
                 self.updater.install_update(zip_path)
             else:
@@ -2799,7 +2545,7 @@ class AddEditSourceWindow:
         self.window.destroy()
 
 def main():
-    current_version = 'v1.1.0'
+    current_version = 'v1.1.1'
     if platform.system() == "Windows":
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     root = tk.Tk()
@@ -2815,7 +2561,7 @@ def main():
                 },
                 {
                     'type': 'console',
-                    'level': logging.INFO,
+                    'level': logging.DEBUG,
                 }
             ]
         )
